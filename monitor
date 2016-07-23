@@ -1,0 +1,692 @@
+from pox.core import core
+from threading import Thread
+from pox.lib.util import dpid_to_str
+from pox.lib.packet.ethernet import ethernet
+from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.tcp import tcp
+from pox.lib.packet.arp import arp
+from pox.lib.packet.dhcp import dhcp
+from pox.lib.packet.icmp import icmp
+from pox.lib.recoco import Timer
+from pox.lib.addresses import IPAddr
+from pox.lib.addresses import EthAddr
+from pox.lib.revent import EventRemove
+
+from Queue import Queue
+from threading import Thread
+
+import time
+import struct
+
+################################################################################
+#    Default Config Variable
+################################################################################
+CEPH_PORT                        = 6789
+CEPH_MONITOR_NUM                 = 3
+CEPH_PRINT_MSG                   = False
+
+CEPH_MONITOR_IP                  = ['192.168.124.201', '192.168.124.202']
+CEPH_OSD_IP                      = []
+
+OF_FULL_PAYLOAD_LEN              = 0x7fff
+
+MTU                              = 1500
+
+
+################################################################################
+#    CEPH Message Hex Code
+################################################################################
+
+# message exchange protocol
+COD_CEPH_MSGR_TAG_READY          = '01'
+COD_CEPH_MSGR_TAG_RESETSESSION   = '02'
+COD_CEPH_MSGR_TAG_WAIT           = '03'
+COD_CEPH_MSGR_TAG_RETRY_SESSION  = '04'
+COD_CEPH_MSGR_TAG_RETRY_GLOBAL   = '05'
+COD_CEPH_MSGR_TAG_CLOSE          = '06'
+COD_CEPH_MSGR_TAG_MSG            = '07'
+COD_CEPH_MSGR_TAG_ACK            = '08'
+COD_CEPH_MSGR_KEEPALIVE          = '09'
+COD_CEPH_MSGR_TAG_BADPROTOVER    = '0a'
+COD_CEPH_MSGR_TAG_BADAUTHORIZER  = '0b'
+COD_CEPH_MSGR_TAG_FEATURES       = '0c'
+COD_CEPH_MSGR_TAG_SEQ            = '0d'
+COD_CEPH_MSGR_TAG_KEEPALIVE2     = '0e'
+COD_CEPH_MSGR_TAG_KEEPALIVE2_ACK = '0f'
+
+
+# monitor internal
+COD_CEPH_MON_SCRUB               = '4000'
+COD_CEPH_MON_ELECTION            = '4100'
+COD_CEPH_MON_PAXOS               = '4200'
+COD_CEPH_MON_PROBE               = '4300'
+COD_CEPH_MON_JOIN                = '4400'
+COD_CEPH_MON_SYNC                = '4500'
+
+# monitor <-> mon admin tool
+COD_CEPH_MON_COMMAND             = ''
+COD_CEPH_MON_COMMAND_ACK         = ''
+COD_CEPH_LOG                     = ''
+COD_CEPH_LOGACK                  = ''
+COD_CEPH_CLASS                   = ''
+COD_CEPH_CLASS_ACK               = ''
+COD_CEPH_GETPOOLSTATS            = ''
+COD_CEPH_GETPOOLSTATSREPLY       = ''
+COD_CEPH_MON_GLOBAL_ID           = ''
+
+
+
+################################################################################
+#    CEPH Message Unpack Format
+################################################################################
+FMT_CEPH_MSGR_TAG_ACK            = '!BQ'
+FMT_CEPH_MSGR_TAG_MSG            = '!BQQHHHIIIHBQHHI'
+FMT_CEPH_MSGR_TAG_KEEPALIVE      = '!B'
+FMT_CEPH_MSGR_TAG_KEEPALIVE2     = '!BQ'
+FMT_CEPH_MSGR_TAG_KEEPALIVE2_ACK = '!BQ'
+
+
+FMT_CEPH_MSG_FOOTER              = '!IIIQB'
+
+FMT_CEPH_MON_PAXOS               = '!IIQQQQQQQQQ'
+
+
+
+################################################################################
+#    CEPH Message Length
+################################################################################
+LEN_CEPH_MSGR_KEEPALIVE          = 1
+LEN_CEPH_MSGR_TAG_READY          = 1
+LEN_CEPH_MSGR_TAG_KEEPALIVE2     = 9
+LEN_CEPH_MSGR_TAG_KEEPALIVE2_ACK = 9
+LEN_CEPH_MSGR_TAG_ACK            = 9
+LEN_CEPH_MSGR_TAG_MSG            = 54
+
+LEN_CEPH_MON_PAXOS               = 80
+
+LEN_CEPH_MSG_HEADER              = 53
+LEN_CEPH_MSG_FOOTER              = 21
+
+
+
+################################################################################
+#    CEPH Message Class
+################################################################################
+
+class CEPH_MSGR_TAG_READY():
+    def __init__(self, raw=None):
+        self.tag = 0x01
+        self.raw = raw
+    def __str__(self):
+        s = "CEPH_MSGR_KEEPALIVE (Tag: %02x)" % (self.tag)
+        return s
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    Keepalive Message    0x09
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class CEPH_MSGR_KEEPALIVE():
+
+    ip_id = int(time.time())
+
+    def __init__(self, raw=None):
+        self.tag = 0x09
+        self.raw = raw
+
+    def __str__(self):
+        s = "CEPH_MSGR_KEEPALIVE (Tag: %02x)" % (self.tag)
+        return s
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    Keepalive2 Message    0x0e
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class CEPH_MSGR_TAG_KEEPALIVE2():
+
+    ip_id = int(time.time())
+
+    def __init__(self, raw=None):
+        self.min_len   = LEN_CEPH_MSGR_TAG_KEEPALIVE2
+
+        self.tag       = 0x0e
+        self.timestamp = 0
+
+        if raw != None:
+            self.parse(raw)
+
+    def parse(self, raw):
+        assert isinstance(raw, bytes)
+        if len(raw) < self.min_len:
+            return
+
+        (self.tag, self.timestamp) \
+        = struct.unpack(FMT_CEPH_MSGR_TAG_KEEPALIVE2, raw[:self.min_len])
+
+        self.parsed = True
+
+    def __str__(self):
+        s = "CEPH_MSGR_TAG_KEEPALIVE2 (Tag: %02x, Timestamp: %016x)" % \
+            (self.tag, self.timestamp)
+
+        return s
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    Keepalive ACK Message    0x0f
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class CEPH_MSGR_TAG_KEEPALIVE2_ACK():
+
+    ip_id = int(time.time())
+
+    def __init__(self, raw=None):
+        self.min_len = LEN_CEPH_MSGR_TAG_KEEPALIVE2_ACK
+
+        self.tag       = 0x0f
+        self.timestamp = 0
+
+        if raw != None:
+            self.parse(raw)
+
+    def parse(self, raw):
+        assert isinstance(raw, bytes)
+        if len(raw) < self.min_len:
+            return
+
+        (self.tag, self.timestamp) \
+        = struct.unpack(FMT_CEPH_MSGR_TAG_KEEPALIVE2_ACK, raw[:self.min_len])
+
+        self.parsed = True
+
+    def __str__(self):
+        s = "CEPH_MSGR_TAG_KEEPALIVE2_ACK (Tag: %02x, Timestamp: %016x)" % \
+            (self.tag, self.timestamp)
+
+        return s
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    TAG ACK Message    0x08
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class CEPH_MSGR_TAG_ACK():
+
+    ip_id = int(time.time())
+
+    def __init__(self, raw=None):
+        self.min_len = LEN_CEPH_MSGR_TAG_ACK
+
+        self.tag = 0x08
+        self.seq = 0
+
+        if raw != None:
+            self.parse(raw)
+
+    def parse(self, raw):
+        assert isinstance(raw, bytes)
+        if len(raw) < self.min_len:
+            return
+
+        self.tag, self.seq = struct.unpack(FMT_CEPH_MSGR_TAG_ACK, raw[:self.min_len])
+        self.parsed = True
+
+    def __str__(self):
+        s = "CEPH_MSGR_TAG_ACK (Tag: %02x, Seq: %08x)" % (self.tag, self.seq)
+        return s
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    TAG Message    0x07
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class CEPH_MSGR_TAG_MSG():
+    def __init__(self, raw=None):
+        self.min_len        = LEN_CEPH_MSGR_TAG_MSG
+
+        self.tag            = 0x07
+
+        # MSG Header
+        self.seq            = 0
+        self.tid            = 0
+        self.type           = 0
+        self.priority       = 0
+        self.version        = 0
+
+        self.front_len      = 0
+        self.middle_len     = 0
+        self.data_len       = 0
+        self.data_off       = 0
+
+        self.src            = 0
+        self.num            = 0
+
+        self.compat_version = 0
+        self.reserved       = 0
+        self.crc            = 0
+
+        self.footer         = CEPH_MSG_FOOTER()
+
+        if raw != None:
+            self.parse(raw)
+
+    def parse(self, raw):
+        assert isinstance(raw, bytes)
+
+        if len(raw) != self.min_len:
+            return
+
+        (self.tag, self.min_len, self.tid, self.type, self.priority, self.version, \
+         self.front_len, self.middle_len, self.data_len, self.data_off, \
+         self.src, self.num, self.compat_version, self.reserved, self.crc) \
+        = struct.unpack(FMT_CEPH_MSGR_TAG_MSG, raw[:self.min_len])
+
+        self.parsed = True
+
+    def parse_footer(self, raw):
+        ceph_msg_len = self.front_len + self.middle_len + self.data_len
+
+    def __str__(self):
+
+        s = "CEPH_MSGR_TAG_MSG (Tag: %02x, Seq: %016x, Tid: %016x, Type: %04x, Pri: %04x, Ver: %04x, F_len: %08x, M_len: %08x, D_len: %08x, D_off: %04x, Src: %02x, Num: %016x, Cmp: %04x, Res: %04x, Crc: %08x)" % \
+            (self.tag, self.seq, self.tid, self.type, self.priority, \
+             self.version, self.front_len, self.middle_len, self.data_len, \
+             self.data_off, self.src, self.num, self.compat_version, \
+             self.reserved, self.crc)
+
+        return s
+
+    def checksum(self):
+        return
+
+    def hdr(self):
+        return
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    MON PAXOS Message    0x4200
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class CEPH_MON_PAXOS():
+
+    def __init__(self, raw):
+        self.min_len         = LEN_CEPH_MON_PAXOS
+
+        self.epoch           = 0
+        self.op              = 0
+        self.first_committed = 0
+        self.last_committed  = 0
+        self.pn_from         = 0
+        self.pn              = 0
+        self.uncommitted_pn  = 0
+        self.lease_timestamp = 0
+        self.sent_timestamp  = 0
+        self.latest_version  = 0
+        self.latest_value    = 0
+
+        if raw != None:
+            self.parse(raw)
+
+    def parse(self, raw):
+        assert isinstance(raw, bytes)
+
+        if len(raw) != self.min_len:
+            return
+
+        (self.epoch, self.op, self.first_committed, self.last_committed, self.pn_from, \
+         self.pn, self.uncommitted_pn, self.lease_timestamp, self.sent_timestamp, \
+         self.latest_version, self.latest_value) \
+        = struct.unpack(FMT_CEPH_MON_PAXOS, raw[:self.min_len])
+
+        self.parsed = True
+
+    def __str__(self):
+        s = "CEPH_MON_PAXOS (Epoch: %08x, OP: %08x, Fst_cmit: %016x, Lst_cmit: %016x, PN_from: %016x, PN: %016x, Un_cmit: %016x, Lease_t: %016x, Sent_t: %016x, Lat_ver: %016x, Lat_val: %016x)" % \
+            (self.epoch, self.op, self.first_committed, self.last_committed, \
+             self.pn_from, self.pn, self.uncommitted_pn, self.lease_timestamp, \
+             self.sent_timestamp, self.latest_version, self.latest_value)
+
+        return s
+
+    def hdr(self):
+        return
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    MON PAXOS Message    0x5700
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class MSG_PGSTATS():
+    def __init__(self, raw):
+        return
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    MON PAXOS Message    0x5800
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class MSG_PGSTATSACK():
+    def __init__(self, raw):
+        return
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    FOOTER Message
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class CEPH_MSG_FOOTER():    # 21 bytes
+    def __init__(self, raw=None):
+        self.min_len    = LEN_CEPH_MSG_FOOTER
+
+        self.front_crc  = 0
+        self.middle_crc = 0
+        self.data_crc   = 0
+        self.sig        = 0
+        self.flags      = 0
+
+        if raw != None:
+            self.parse(raw)
+
+    def parse(self, raw):
+        assert isinstance(raw, bytes)
+
+        if len(raw) != self.min_len:
+            return
+
+        (self.front_crc, self.middle_crc, self.data_crc, self.sig, self.flags) \
+        = struct.unpack(FMT_CEPH_MSG_FOOTER, raw[:self.min_len])
+
+        self.parsed = True
+
+    def __str__(self):
+        s = "CEPH_MSG_FOOTER (F_crc: %08x, M_crc: %08x, D_crc: %08x, Sig: %016x, Flags: %01x)" %\
+            (self.front_crc, self.middle_crc, self.data_crc, self.sig, self.flags)
+
+        return s
+
+    def hdr(self):
+        return
+
+
+################################################################################
+#    Utility Functions
+################################################################################
+def split_str(str_data, chunk_size):
+    hex_data = []
+    for start in range(0, len(str_data), chunk_size):
+        hex_data.append(str_data[start:start+chunk_size])
+    return hex_data
+    #return [ str_data[start:start+chunk_size] for start in range(0, len(str_data), chunk_size) ]
+
+def reverse_dec(raw_dec):
+    seq_hx = ''
+    #print msg_l
+    for byt in reversed(raw_dec):
+        byt_hx = '%02x' %(byt)
+        #byt_hx = hex(byt).replace('0x','')
+        seq_hx = seq_hx+byt_hx
+    return seq_hx
+
+def reverse_hex(raw_hex):
+    return "".join(reversed([raw_hex[i:i+2] for i in range(0, len(raw_hex), 2)]))
+
+def reverse_hex_2(raw_hex):
+#    b = [raw_hex[i:i+2] for i in range(0, len(raw_hex), 2)]
+    b = []
+    for i in range(0, len(raw_hex), 2):
+       b.append(raw_hex[i:i+2])
+    return "".join(reversed(b))
+
+'''
+def reverse_hex(hex_data):
+    n = len(hex_data) / 2
+    fmt = '%dh' % n
+    return struct.pack(fmt, *reversed(struct.unpack(fmt, hex_data)))
+'''
+
+
+################################################################################
+#    POX Controller Processing
+################################################################################
+
+
+
+class CEPH_MON_PROXY(object):
+    def __init__(self):
+        return
+
+
+
+class TCP_TRACKER(object):
+    def __init__(self, tcp):
+        self.tcp = tcp
+
+
+
+class MONITOR(object):
+
+    def __init__(self):
+        self.num_mon = 2
+        self.mon_leader = None
+
+        self.payload_cache = dict()
+
+        self.count_PacketIn = 0
+        core.openflow.addListeners(self)
+
+        self.mon_tcp_flow_queue = dict()
+        self.mon_tcp_last_seq = dict()
+
+        self._init_tcp_flow_queue()
+
+        # need a for loop to generate a thread for each tcp flow reassemble
+
+
+    def _init_tcp_flow_queue(self):
+
+        for src_mon_ip in CEPH_MONITOR_IP:
+            for dst_mon_ip in CEPH_MONITOR_IP:
+                if dst_mon_ip != src_mon_ip:
+
+                    tcp_key = src_mon_ip + '_' + dst_mon_ip
+                    self.mon_tcp_flow_queue[tcp_key] = Queue()
+                    self.mon_tcp_last_seq[tcp_key] = 0
+                    reassembler = Thread(name='tcp_key',
+                                         target=self._tcp_reassemble,
+                                         args=(tcp_key,))
+                    reassembler.setDaemon(True)
+                    reassembler.start()
+
+    def _tcp_reassemble(self, tcp_key):
+        # print "payload is larger than 1448, keep it in queue"
+        queue = self.mon_tcp_flow_queue[tcp_key]
+
+        while True:
+            #print "\"%s\"" % tcp_key
+            tcp_packet = queue.get()
+            raw = tcp_packet.payload
+            payload_len = MTU - tcp_packet.hdr_len - ipv4.MIN_LEN
+            raw_data_list = list()
+
+            while len(raw) == payload_len:
+                raw_data_list.append(raw)
+                next_tcp_packet = queue.get()
+                next_raw = next_tcp_packet.payload
+                raw_data_list.append(next_raw)
+
+                if len(next_raw) < (MTU - tcp_packet.hdr_len - ipv4.MIN_LEN):
+                    raw = b''.join(raw_data_list)
+                    break
+
+            raw_len = len(raw)
+            #print "raw_len: ", raw_len
+
+            #if len(raw) != 0:
+            #    print raw.encode('hex_codec')
+
+            self._ceph_msg_parser(raw, raw_len)
+
+    def _ceph_msg_parser(self, raw, msg_len):
+
+        offset = 0
+        while offset < msg_len:
+            msg_tag = struct.unpack('!B', raw[offset:offset+LEN_CEPH_MSGR_KEEPALIVE])
+            #print offset, msg_len
+            tag = ("%02x" % msg_tag)
+            if tag == COD_CEPH_MSGR_TAG_KEEPALIVE2_ACK:  # 0f
+                msg = CEPH_MSGR_TAG_KEEPALIVE2_ACK(raw[offset:offset+LEN_CEPH_MSGR_TAG_KEEPALIVE2_ACK])
+                offset += LEN_CEPH_MSGR_TAG_KEEPALIVE2_ACK
+                #print msg
+            elif tag == COD_CEPH_MSGR_TAG_KEEPALIVE2:  # 0e
+                msg = CEPH_MSGR_TAG_KEEPALIVE2(raw[offset:offset+LEN_CEPH_MSGR_TAG_KEEPALIVE2])
+                offset += LEN_CEPH_MSGR_TAG_KEEPALIVE2
+                #print msg
+            elif tag == COD_CEPH_MSGR_KEEPALIVE:  # 09
+                msg = CEPH_MSGR_KEEPALIVE(raw[offset:offset+LEN_CEPH_MSGR_KEEPALIVE])
+                offset += LEN_CEPH_MSGR_KEEPALIVE
+                #print msg
+            elif tag == COD_CEPH_MSGR_TAG_ACK:  # 08
+                msg = CEPH_MSGR_TAG_ACK(raw[offset:offset+LEN_CEPH_MSGR_TAG_ACK])
+                offset += LEN_CEPH_MSGR_TAG_ACK
+                #print msg
+            elif tag == COD_CEPH_MSGR_TAG_MSG:  # 07
+                msg = CEPH_MSGR_TAG_MSG(raw[offset:offset+LEN_CEPH_MSGR_TAG_MSG])
+                offset += LEN_CEPH_MSGR_TAG_MSG
+                print msg
+
+                #print hex(msg.front_len)[2:]
+
+                f_len = reverse_hex(hex(msg.front_len)[2:])
+                m_len = reverse_hex(hex(msg.middle_len)[2:])
+                d_len = reverse_hex(hex(msg.data_len)[2:])
+                footer_offset = offset + int(f_len, 16) + int(m_len, 16) + int(d_len, 16)
+                #print int(f_len, 16)+int(m_len, 16)+int(d_len, 16)
+
+                msg_type = ("%04x" % msg.type)
+
+                if msg_type == COD_CEPH_MON_PAXOS:  # 4200
+                    msg = CEPH_MON_PAXOS(raw[offset:offset+LEN_CEPH_MON_PAXOS])
+                    offset += LEN_CEPH_MON_PAXOS
+                    print msg
+                elif msg_type == COD_CEPH_MON_SCRUB:  # 4100
+                    print "4100"
+                elif msg_type == COD_CEPH_MON_SCRUB:  # 4000
+                    print "4000"
+                elif msg_type == COD_CEPH_MON_PROBE:  # 4300
+                    print "4300"
+                elif msg_type == COD_CEPH_MON_JOIN:  # 4400
+                    print "4400"
+                elif msg_type == COD_CEPH_MON_SYNC:  # 4500
+                    print "4500"
+
+                else:
+                    print("Unknown CEPH Message Type: %04x " % msg.type)
+                    last_raw = raw[offset:footer_offset]
+                    #print last_raw.encode('hex_codec')
+
+                footer = CEPH_MSG_FOOTER(raw[footer_offset:footer_offset+LEN_CEPH_MSG_FOOTER])
+                offset += LEN_CEPH_MSG_FOOTER
+                print footer
+
+                #if len(raw[offset:]) == LEN_CEPH_MSG_FOOTER:
+            elif tag == COD_CEPH_MSGR_TAG_READY:  # 01
+                print "COD_CEPH_MSGR_TAG_READY", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_RESETSESSION:  # 02
+                print "COD_CEPH_MSGR_TAG_RESETSESSION", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_WAIT:  # 03
+                print "COD_CEPH_MSGR_TAG_RESETSESSION", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_RETRY_SESSION:  # 04
+                print "COD_CEPH_MSGR_TAG_RETRY_SESSION", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_RETRY_GLOBAL:  # 05
+                print "COD_CEPH_MSGR_TAG_RETRY_GLOBAL", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_CLOSE:  # 06
+                print "COD_CEPH_MSGR_TAG_CLOSE", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_BADPROTOVER:  # 07
+                print "COD_CEPH_MSGR_TAG_BADPROTOVER", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_BADAUTHORIZER:  # 08
+                print "COD_CEPH_MSGR_TAG_BADAUTHORIZER", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_FEATURES:  # 09
+                print "COD_CEPH_MSGR_TAG_FEATURES", msg_len
+                break
+            elif tag == COD_CEPH_MSGR_TAG_SEQ:  # 0a
+                print "COD_CEPH_MSGR_TAG_SEQ", msg_len
+                break
+            else:
+                #print msg_len, tcp.payload.encode('hex_codec')
+                #left_raw = raw[offset:]
+                #print("%02x" % msg_tag), left_raw.encode('hex_codec')
+                print tag, len(raw[offset:])
+                #print left_raw.encode('hex_codec')
+                break
+
+        #print ""
+        #print ""
+
+
+    def _tcp_dispatcher(self, tcp_packet, tcp_key):
+        '''
+            Dispatching received tcp packet to belonging queue
+        '''
+        if tcp_key in self.mon_tcp_flow_queue:
+
+            tcp_queue = self.mon_tcp_flow_queue[tcp_key]
+            raw = tcp_packet.payload
+            raw_len = len(raw)
+
+            if tcp_key == "192.168.124.202_192.168.124.201":
+                direction = 'mon01 <-- mon02'
+            else:
+                direction = 'mon01 --> mon02'
+
+            #print direction, tcp_packet.seq, tcp_packet.ack, raw_len
+
+            # maybe have to handle sequence before put into queue...
+            # seq num plus len of payload will be next next seq
+            # if it exceeds 2^32, than roll back to 0 and keep adding num left.
+            # ex. if len is 1448, the seq num is 4294967290
+            # so, after add 5 to seq will reach max num, so then count from 0
+            # and seq num become 1443
+
+            #if tcp_packet.seq < self.mon_tcp_last_seq[tcp_key]:
+            #    self.mon_tcp_last_seq[tcp_key] = tcp_packet.seq
+
+            tcp_queue.put(tcp_packet)
+
+
+
+    def _handle_PacketIn(self, event):
+        self.count_PacketIn = self.count_PacketIn+1
+        inport = event.port
+        packet = event.parsed
+
+        if not packet.parsed:
+            return
+
+        # return if not ipv4 packet
+        if isinstance(packet.next, ipv4):
+            src_ip = str(packet.next.srcip)
+            dst_ip = str(packet.next.dstip)
+        else:
+            return
+
+        # return if packet is not relate to monitors
+        if src_ip not in CEPH_MONITOR_IP and dst_ip not in CEPH_MONITOR_IP:
+            return
+
+        # return if no tcp header
+        tcp_packet = packet.find('tcp')
+        if tcp_packet == None:
+            return
+
+        # return if not using ceph port
+        if tcp_packet.srcport != CEPH_PORT and tcp_packet.dstport != CEPH_PORT:
+            return
+
+        # set tcp_key and dispatche it
+        tcp_key = src_ip + "_" + dst_ip
+        self._tcp_dispatcher(tcp_packet, tcp_key)
+
+        # To do: need to check tcp assemble if required....
+#        if len(tcp.payload) >= (MTU - tcp.hdr_len - ipv4.MIN_LEN):
+#            self.tcp_reassemble(tcp.payload)
+
+
+
+        return
+
+def launch():
+  core.openflow.miss_send_len = OF_FULL_PAYLOAD_LEN
+  core.getLogger().info("Requesting full packet payloads")
+  core.registerNew(MONITOR)
+
